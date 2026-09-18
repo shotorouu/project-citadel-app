@@ -28,6 +28,7 @@ LABEL maintainer="stefanprodan"
 
 RUN addgroup -S app \
     && adduser -S -G app app \
+    && apk upgrade \
     && apk --no-cache add \
     ca-certificates curl netcat-openbsd
 
