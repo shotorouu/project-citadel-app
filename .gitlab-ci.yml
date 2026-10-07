@@ -1,0 +1,218 @@
+stages:
+  - lint
+  - test
+  - scan
+  - build
+  - report
+
+workflow:
+  rules:
+    # 1. Disable MR pipelines to avoid duplicates
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    # 2. Run on all branch pushes (main, feature branches, etc.)
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  AWS_REGION: "us-east-1"
+  ECR_REGISTRY: "183255892104.dkr.ecr.us-east-1.amazonaws.com"
+  ECR_REPO: "183255892104.dkr.ecr.us-east-1.amazonaws.com/citadel_repository"
+  S3_REPORT: "citadel-compliance-shotorouu-dev"
+  IMAGE_REF: "$ECR_REPO:$CI_COMMIT_SHORT_SHA"
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
+
+golangci-lint:
+  stage: lint
+  image: golangci/golangci-lint:v2.13.2-alpine
+  script:
+    - golangci-lint run --out-format json > gl-code-quality-report.json
+  artifacts:
+    when: always
+    paths:
+      - gl-code-quality-report.json
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:
+  stage: test
+  image: docker:24-cli
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache bash git curl helm
+    # kubectl
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    # kind
+    - curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+    - chmod +x ./kind && mv ./kind /usr/local/bin/
+    # kind conf
+    - |
+      cat <<EOF > kind-config.yaml
+      kind: Cluster
+      apiVersion: kind.x-k8s.io/v1alpha4
+      networking:
+        apiServerAddress: "0.0.0.0"
+        apiServerPort: 6443
+      nodes:
+      - role: control-plane
+        image: kindest/node:v1.30.0
+      EOF
+    # cluster & conf
+    - kind create cluster --config kind-config.yaml
+    - kubectl config set-cluster kind-kind --server="https://docker:6443"
+    - kubectl config set-cluster kind-kind --insecure-skip-tls-verify=true
+  script:
+    - bash ./test/e2e.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+trivy-fs:
+  stage: scan
+  image:
+    name: aquasec/trivy:0.74.0
+    entrypoint: [""]
+  cache:
+    key: trivy-cache
+    paths:
+      - .trivy-cache/
+  variables:
+    TRIVY_CACHE_DIR: ".trivy-cache"
+    TRIVY_SEVERITY: "CRITICAL,HIGH"
+    TRIVY_IGNORE_UNFIXED: true
+    TRIVY_TIMEOUT: "5m"
+  script:
+    - 'echo "Scanning project: $CI_PROJECT_DIR"'
+    # Report MEDIUM/LOW without failing the pipeline
+    - >
+      trivy fs --scanners vuln,secret,misconfig
+      --exit-code 0
+      --severity MEDIUM,LOW
+      --ignore-unfixed
+      --cache-dir $TRIVY_CACHE_DIR
+      --timeout $TRIVY_TIMEOUT
+      --format json
+      --output trivy-all.json
+      ./
+    # Fail on Critical/High
+    - >
+      trivy fs --scanners vuln,secret,misconfig
+      --exit-code 1
+      --severity $TRIVY_SEVERITY
+      --ignore-unfixed
+      --cache-dir $TRIVY_CACHE_DIR
+      --timeout $TRIVY_TIMEOUT
+      --format json
+      --output trivy-critical.json
+      ./
+  artifacts:
+    when: always
+    paths:
+      - trivy-all.json
+      - trivy-critical.json
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+build:
+  stage: build
+  image: docker:29
+  variables:
+    AWS_IAM_ROLE_ARN: "arn:aws:iam::183255892104:role/gitlab-ci-oidc-role"
+    TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivycache"
+  services:
+    - docker:29-dind
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - apk add --no-cache aws-cli
+    - aws --version
+
+    # AWS OIDC
+    - echo "${AWS_OIDC_TOKEN}" > /tmp/web_identity_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web_identity_token"
+    - export AWS_ROLE_ARN="${AWS_IAM_ROLE_ARN}"
+
+    # ECR Login (Added)
+    - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+    # Trivy (docker)
+    - docker create --name trivy_temp aquasec/trivy:latest
+    - docker cp trivy_temp:/usr/local/bin/trivy /usr/local/bin/trivy
+    - docker rm trivy_temp
+
+  script:
+    - docker build -t "$IMAGE_REF" .
+
+    # Fail the build if critical CVEs exist
+    - >
+      trivy image
+      --severity HIGH,CRITICAL
+      --ignore-unfixed
+      --exit-code 1
+      --cache-dir $TRIVY_CACHE_DIR
+      --format json
+      --no-progress
+      --output trivy-image.json
+      "$IMAGE_REF"
+
+    # SBOM gen
+    - trivy image --format cyclonedx --no-progress --output sbom.cdx.json "$IMAGE_REF"
+
+    # push to ecr (main only)
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then
+        docker push "$IMAGE_REF"
+      fi
+  artifacts:
+    paths:
+      - trivy-image.json
+      - sbom.cdx.json
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+
+upload_reports_to_s3:
+  stage: report
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
+  variables:
+    AWS_IAM_ROLE_ARN: "arn:aws:iam::183255892104:role/gitlab-ci-oidc-role"
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: https://gitlab.com
+  needs:
+    - job: golangci-lint
+      artifacts: true
+    - job: trivy-fs
+      artifacts: true
+    - job: build
+      artifacts: true
+  before_script:
+    # AWS OIDC
+    - echo "${AWS_OIDC_TOKEN}" > /tmp/web_identity_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web_identity_token"
+    - export AWS_ROLE_ARN="${AWS_IAM_ROLE_ARN}"
+  script:
+
+    - echo "Organizing artifacts for S3 upload..."
+    - mkdir -p reports
+
+    - cp gl-code-quality-report.json reports/ 2>/dev/null || true
+    - cp trivy-all.json reports/ 2>/dev/null || true
+    - cp trivy-critical.json reports/ 2>/dev/null || true
+    - cp trivy-image.json reports/ 2>/dev/null || true
+    - cp sbom.cdx.json reports/ 2>/dev/null || true
+
+    - echo "Uploading to S3 bucket..."
+    - aws s3 cp reports/ "s3://$S3_REPORT/builds/${CI_COMMIT_SHA}/" --recursive
+
+  when: always
+
