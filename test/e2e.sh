@@ -24,8 +24,12 @@ spec:
   selfSigned: {}
 EOF
 
-# Install podinfo with TLS enabled
-helm upgrade --install --wait podinfo ./charts/podinfo \
+# Add and update podinfo repository
+helm repo add podinfo https://stefanprodan.github.io/podinfo
+helm repo update
+
+# Install podinfo from the remote repo
+helm upgrade --install --wait podinfo podinfo/podinfo \
     --set image.repository=test/podinfo \
     --set image.tag=latest \
     --set tls.enabled=true \
