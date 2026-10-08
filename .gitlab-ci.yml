@@ -24,7 +24,7 @@ variables:
 
 golangci-lint:
   stage: lint
-  image: golangci/golangci-lint:v2.13.2-alpine
+  image: golangci/golangci-lint:v2.14-alpine
   script:
     - golangci-lint run --out-format json > gl-code-quality-report.json
   artifacts:
@@ -130,7 +130,7 @@ build:
     AWS_OIDC_TOKEN:
       aud: https://gitlab.com
   before_script:
-    - apk add --no-cache aws-cli
+    - apk add --no-cache aws-cli curl tar ca-certificates
     - aws --version
 
     # AWS OIDC
@@ -141,10 +141,8 @@ build:
     # ECR Login (Added)
     - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-    # Trivy (docker)
-    - docker create --name trivy_temp aquasec/trivy:latest
-    - docker cp trivy_temp:/usr/local/bin/trivy /usr/local/bin/trivy
-    - docker rm trivy_temp
+    # Trivy binary
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
   script:
     - docker build -t "$IMAGE_REF" .
