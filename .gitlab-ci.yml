@@ -133,6 +133,10 @@ build:
     - apk add --no-cache aws-cli curl tar ca-certificates
     - aws --version
 
+    # Install kubectl
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+
     # AWS OIDC
     - echo "${AWS_OIDC_TOKEN}" > /tmp/web_identity_token
     - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web_identity_token"
@@ -162,11 +166,19 @@ build:
     # SBOM gen
     - trivy image --format cyclonedx --no-progress --output sbom.cdx.json "$IMAGE_REF"
 
-    # push to ecr (main only)
+    # Push to ECR and restart deployment (main only) & Rollout restart for ArgoCD IMage Updater
     - |
       if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then
         docker push "$IMAGE_REF"
+        if aws eks update-kubeconfig --region "$AWS_REGION" --name citadel-cluster; then
+          kubectl rollout restart deployment/argocd-image-updater -n argocd || {
+            echo "kubectl rollout restart failed (cluster may be under maintenance). Continuing pipeline"
+          }
+        else
+          echo "Unable to connect to EKS cluster. Skipping rollout restart"
+        fi
       fi
+
   artifacts:
     paths:
       - trivy-image.json
