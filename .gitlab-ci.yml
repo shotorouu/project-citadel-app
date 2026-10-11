@@ -139,16 +139,17 @@ build:
     - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
     - chmod +x kubectl && mv kubectl /usr/local/bin/
 
-    # AWS OIDC
-    - echo "${AWS_OIDC_TOKEN}" > /tmp/web_identity_token
-    - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web_identity_token"
-    - export AWS_ROLE_ARN="${AWS_IAM_ROLE_ARN}"
+    # Trivy binary (same version as trivy-fs)
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.74.0/contrib/install.sh | sh -s -- -b /usr/local/bin v0.74.0
 
-    # ECR Login (Added)
-    - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-    # Trivy binary
-    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    # AWS OIDC + ECR login (main only)
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        echo "${AWS_OIDC_TOKEN}" > /tmp/web_identity_token
+        export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web_identity_token"
+        export AWS_ROLE_ARN="${AWS_IAM_ROLE_ARN}"
+        aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      fi
 
   script:
     - docker build -t "$IMAGE_REF" .
@@ -189,17 +190,10 @@ upload_reports_to_s3:
     name: amazon/aws-cli:latest
     entrypoint: [""]
   variables:
-    AWS_IAM_ROLE_ARN: "arn:aws:iam::183255892104:role/gitlab-ci-oidc-role"
+    AWS_IAM_ROLE_ARN: "arn:aws:iam::183255892104:role/gitlab-ci-reports-role"
   id_tokens:
     AWS_OIDC_TOKEN:
       aud: https://gitlab.com
-  needs:
-    - job: golangci-lint
-      artifacts: true
-    - job: trivy-fs
-      artifacts: true
-    - job: build
-      artifacts: true
   before_script:
     # AWS OIDC
     - echo "${AWS_OIDC_TOKEN}" > /tmp/web_identity_token
@@ -220,4 +214,3 @@ upload_reports_to_s3:
     - aws s3 cp reports/ "s3://$S3_REPORT/builds/${CI_COMMIT_SHA}/" --recursive
 
   when: always
-
