@@ -13,6 +13,7 @@ workflow:
     # 2. Run on all branch pushes (main, feature branches, etc.)
     - if: $CI_COMMIT_BRANCH
 
+
 variables:
   AWS_REGION: "us-east-1"
   ECR_REGISTRY: "183255892104.dkr.ecr.us-east-1.amazonaws.com"
@@ -66,8 +67,8 @@ test:
       EOF
     # cluster & conf
     - kind create cluster --config kind-config.yaml
-    - kubectl config set-cluster kind-kind --server="https://docker:6443"
-    - kubectl config set-cluster kind-kind --insecure-skip-tls-verify=true
+    - kubectl config unset clusters.kind-kind.certificate-authority-data
+    - kubectl config set-cluster kind-kind --server="https://docker:6443" --insecure-skip-tls-verify=true
   script:
     - bash ./test/e2e.sh
   rules:
@@ -167,17 +168,10 @@ build:
     # SBOM gen
     - trivy image --format cyclonedx --no-progress --output sbom.cdx.json "$IMAGE_REF"
 
-    # Push to ECR and restart deployment (main only) & Rollout restart for ArgoCD IMage Updater
+    # Push to ECR and restart deployment (main only)
     - |
       if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then
         docker push "$IMAGE_REF"
-        if aws eks update-kubeconfig --region "$AWS_REGION" --name citadel-cluster; then
-          kubectl rollout restart deployment/argocd-image-updater -n argocd || {
-            echo "kubectl rollout restart failed (cluster may be under maintenance). Continuing pipeline"
-          }
-        else
-          echo "Unable to connect to EKS cluster. Skipping rollout restart"
-        fi
       fi
 
   artifacts:
